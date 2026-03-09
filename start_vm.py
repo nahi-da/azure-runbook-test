@@ -530,64 +530,7 @@ class AzureStartRunbookOperations:
         print("      -> OK")
         return True, "安全"
 
-    def evaluate_activity_log_alert_condition(
-        self,
-        alert_resource_id: str,
-        log_analytics_workspace_id: str,
-        vm_start_time: datetime,
-    ) -> Tuple[bool, str]:
-        """
-        アクティビティログアラートの条件を評価し、VM起動後に発報対象イベントがないか確認
-
-        VM起動時刻以降のAzureActivityテーブルをKQLでクエリし、
-        アラート条件に一致するイベントが0件であることを確認します。
-
-        Returns:
-            (is_safe, detail_message)
-        """
-        p = parse_resource_id(alert_resource_id)
-        monitor_client = self._monitor(p["subscription"])
-        alert = monitor_client.activity_log_alerts.get(p["resource_group"], p["resource_name"])
-        alert_name = p["resource_name"]
-
-        if not alert.condition or not alert.condition.all_of:
-            self.logger.warning(f"アクティビティログアラートに評価可能な条件がありません: {alert_name}")
-            return True, "条件なし（スキップ）"
-
-        where_clauses: list[str] = []
-        for condition in alert.condition.all_of:
-            if condition.field is None or condition.equals is None:
-                self.logger.debug(f"field/equals が未設定の条件をスキップ: {alert_name}")
-                continue
-            field = condition.field.lower()
-            value = condition.equals
-            kql_column = ACTIVITY_LOG_FIELD_MAP.get(field)
-            if kql_column:
-                if "." in kql_column:
-                    where_clauses.append(f'tostring({kql_column}) =~ "{value}"')
-                else:
-                    where_clauses.append(f'{kql_column} =~ "{value}"')
-            else:
-                self.logger.warning(
-                    f"フィールド '{condition.field}' のAzureActivityマッピングが未定義です。スキップします。"
-                )
-
-        now_utc = datetime.now(timezone.utc)
-        start_str = vm_start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        kql_lines = [
-            "AzureActivity",
-            f'| where TimeGenerated >= datetime("{start_str}")',
-            f'| where TimeGenerated <= datetime("{end_str}")',
-        ]
-        for clause in where_clauses:
-            kql_lines.append(f"| where {clause}")
-        kql_lines.append("| count")
-        kql = "\n".join(kql_lines)
-
-        print(f"      - 種別: アクティビティログアラート")
-        self.logger.debug(f"  KQL クエリ:\n{kql}")
+    VM起動後
 
         response = self._logs_client().query_workspace(
             workspace_id=log_analytics_workspace_id,
