@@ -31,8 +31,8 @@ from functools import wraps
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.monitor import MonitorManagementClient
+from azure.mgmt.resourcehealth import ResourceHealthMgmtClient
 from azure.monitor.query import LogsQueryClient, LogsQueryResult, LogsQueryStatus
-
 
 # ============================================================================
 # 設定セクション
@@ -99,6 +99,7 @@ _ALERT_TYPE_MAP: Dict[str, str] = {
     "microsoft.insights/scheduledqueryrules": "scheduled_query_rules",
     "microsoft.insights/activitylogalerts":   "activity_log_alerts",
 }
+
 
 
 # ============================================================================
@@ -233,6 +234,7 @@ class AzureStartRunbookOperations:
         self.alert_condition_retry_config = alert_condition_retry_config
         self._compute_clients: Dict[str, ComputeManagementClient] = {}
         self._monitor_clients: Dict[str, MonitorManagementClient] = {}
+        self._resourcehealth_clients: Dict[str, ResourceHealthMgmtClient] = {}
         self._logs_query_client: Optional[LogsQueryClient] = None
 
     # ------------------------------------------------------------------
@@ -250,6 +252,12 @@ class AzureStartRunbookOperations:
         if subscription_id not in self._monitor_clients:
             self._monitor_clients[subscription_id] = MonitorManagementClient(self.credential, subscription_id)
         return self._monitor_clients[subscription_id]
+
+    def _resourcehealth(self, subscription_id: str) -> ResourceHealthMgmtClient:
+        """ResourceHealthMgmtClientをサブスクリプション単位でキャッシュして返す"""
+        if subscription_id not in self._resourcehealth_clients:
+            self._resourcehealth_clients[subscription_id] = ResourceHealthMgmtClient(self.credential, subscription_id)
+        return self._resourcehealth_clients[subscription_id]
 
     def _logs_client(self) -> LogsQueryClient:
         """LogsQueryClientをシングルトンとして返す"""
@@ -571,8 +579,7 @@ class AzureStartRunbookOperations:
 
         if category == "resourcehealth":
             return self._evaluate_resourcehealth_alert_condition(
-                alert_name, log_analytics_workspace_id, scopes,
-                alert.condition.all_of, now_utc,
+                alert_name, scopes, alert.condition.all_of, p["subscription"],
             )
         else:
             return self._evaluate_activity_log_alert_count_condition(
@@ -583,138 +590,87 @@ class AzureStartRunbookOperations:
     def _evaluate_resourcehealth_alert_condition(
         self,
         alert_name: str,
-        log_analytics_workspace_id: str,
         scopes: list[str],
         all_of_conditions,
-        now_utc: datetime,
+        subscription_id: str,
     ) -> Tuple[bool, str]:
         """
         ResourceHealthカテゴリのアクティビティログアラート評価
 
-        直近24時間の最新ヘルスイベント1件を取得し、
-        アラート条件（category以外）に一致するか確認する。
-        最新イベントが条件に一致しない（= 現在は正常状態）であれば安全と判断する。
+        azure-mgmt-resourcehealth SDK を使用して現在のリソース正常性を直接取得し、
+        アラート条件（currentHealthStatus / cause）に一致するか確認する。
+        現在の状態が条件に一致しない（= 現在は正常状態）であれば安全と判断する。
         """
-        # スコープフィルタ（対象VMのみに絞る）
-        scope_filter_lines: list[str] = []
-        if scopes:
-            scope_values = ", ".join(f'"{s}"' for s in scopes)
-            scope_filter_lines.append(f"| where ResourceId in~ ({scope_values})")
+        rh_client = self._resourcehealth(subscription_id)
 
-        # アラート条件（category以外）から照合用where句を構築
-        condition_where_lines: list[str] = []
+        # 評価対象リソース: scopes が設定されていればそれを使用、なければ評価不可
+        if not scopes:
+            self.logger.warning(f"アラートルールにscopesが設定されていないためスキップします: {alert_name}")
+            return True, "scopes未設定（スキップ）"
+
+        # アラート条件から評価対象フィールドを抽出
+        # currentHealthStatus / cause のみ SDK で評価可能
+        condition_currenthealth: Optional[str] = None
+        condition_cause: Optional[str] = None
         for cond in all_of_conditions:
             if cond.field is None or cond.equals is None:
                 continue
             field = cond.field.lower()
-            if field == "category":
-                continue  # カテゴリは既に確定済みのためスキップ
-            kql_column = ACTIVITY_LOG_FIELD_MAP.get(field)
-            if kql_column:
-                if "." in kql_column:
-                    condition_where_lines.append(f'| where tostring({kql_column}) =~ "{cond.equals}"')
-                else:
-                    condition_where_lines.append(f'| where {kql_column} =~ "{cond.equals}"')
+            if field == "properties.currenthealthstatus":
+                condition_currenthealth = cond.equals
+            elif field == "properties.cause":
+                condition_cause = cond.equals
+            elif field in ("category", "resourcetype"):
+                pass  # 絞り込み条件のためスキップ
             else:
                 self.logger.warning(
-                    f"フィールド '{cond.field}' のAzureActivityマッピングが未定義です。スキップします。"
+                    f"フィールド '{cond.field}' はResourceHealth APIでは評価できないためスキップします: {alert_name}"
                 )
 
-        # 直近24時間を対象に最新の ResourceHealth イベントを1件取得し、条件との照合を行う
-        lookback_start = now_utc - timedelta(hours=24)
-        lookback_start_str = lookback_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        for resource_id in scopes:
+            try:
+                status = rh_client.availability_statuses.get_by_resource(
+                    resource_uri=resource_id,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"ResourceHealth APIの呼び出しに失敗しました: {alert_name} / {resource_id} ({e})"
+                ) from e
 
-        # ── クエリ1: 最新イベントの詳細を取得してログ出力 ────────────────────────
-        kql_detail_lines = [
-            "AzureActivity",
-            f'| where TimeGenerated >= datetime("{lookback_start_str}")',
-            '| where CategoryValue =~ "ResourceHealth"',
-            '| where isnotempty(tostring(Properties_d.currentHealthStatus))',
-        ]
-        kql_detail_lines.extend(scope_filter_lines)
-        kql_detail_lines += [
-            "| order by TimeGenerated desc",
-            "| take 1",
-            "| project TimeGenerated,"
-            " ResourceId,"
-            " currentHealthStatus = tostring(Properties_d.currentHealthStatus),"
-            " previousHealthStatus = tostring(Properties_d.previousHealthStatus),"
-            " cause = tostring(Properties_d.cause)",
-        ]
-        kql_detail = "\n".join(kql_detail_lines)
+            props = status.properties
+            current_state: str = (props.availability_state or "") if props else ""
+            reason_type: str = (props.reason_type or "") if props else ""
+            occurred_time = props.occured_time if props else None
+            summary: str = (props.summary or "") if props else ""
 
-        self.logger.debug(f"  KQL クエリ (詳細取得):\n{kql_detail}")
-        detail_response = self._logs_client().query_workspace(
-            workspace_id=log_analytics_workspace_id,
-            query=kql_detail,
-            timespan=(lookback_start, now_utc),
-        )
-        if detail_response.status == LogsQueryStatus.FAILURE:
-            raise RuntimeError(
-                f"Log AnalyticsクエリがResourceHealth詳細照会で失敗しました: {alert_name} "
-                f"(エラー: {getattr(detail_response, 'partial_error', 'Unknown')})"
-            )
+            resource_short = resource_id.split("/")[-1]
+            print(f"      - リソース正常性 ({resource_short}):")
+            print(f"          availabilityState : {current_state or '(なし)'}")
+            print(f"          reasonType        : {reason_type or '(なし)'}")
+            print(f"          occurredTime      : {occurred_time or '(なし)'}")
+            print(f"          summary           : {summary or '(なし)'}")
 
-        _detail_tables = (
-            detail_response.tables
-            if isinstance(detail_response, LogsQueryResult)
-            else (detail_response.partial_data or [])
-        )
-        if _detail_tables and _detail_tables[0].rows:
-            row = _detail_tables[0].rows[0]
-            cols = list(_detail_tables[0].columns)
-            def _col(name: str) -> str:
-                idx = cols.index(name) if name in cols else -1
-                return str(row[idx]) if idx >= 0 and row[idx] is not None else "(なし)"
-            print(f"      - 最新ヘルスイベント:")
-            print(f"          TimeGenerated        : {_col('TimeGenerated')}")
-            print(f"          ResourceId           : {_col('ResourceId')}")
-            print(f"          currentHealthStatus  : {_col('currentHealthStatus')}")
-            print(f"          previousHealthStatus : {_col('previousHealthStatus')}")
-            print(f"          cause                : {_col('cause')}")
-        else:
-            print(f"      - 最新ヘルスイベント: 直近24時間以内にイベントなし")
+            # currentHealthStatus 条件の照合
+            if condition_currenthealth is not None:
+                if current_state.lower() == condition_currenthealth.lower():
+                    detail = (
+                        f"現在のリソース正常性が '{current_state}' です"
+                        f"（アラート条件: currentHealthStatus = {condition_currenthealth}）"
+                    )
+                    print(f"    -> アラート発報の可能性があります:")
+                    print(f"       詳細: {detail}")
+                    return False, detail
 
-        # ── クエリ2: 最新イベントがアラート条件に一致するか確認 ─────────────────
-        kql_lines = [
-            "AzureActivity",
-            f'| where TimeGenerated >= datetime("{lookback_start_str}")',
-            '| where CategoryValue =~ "ResourceHealth"',
-            '| where isnotempty(tostring(Properties_d.currentHealthStatus))',
-        ]
-        kql_lines.extend(scope_filter_lines)
-        kql_lines.append("| order by TimeGenerated desc")
-        kql_lines.append("| take 1")            # 最新イベント1件のみに絞る
-        kql_lines.extend(condition_where_lines)  # 最新イベントがアラート条件に一致するか照合
-        kql_lines.append("| count")
-        kql = "\n".join(kql_lines)
-
-        self.logger.debug(f"  KQL クエリ (条件照合):\n{kql}")
-
-        response = self._logs_client().query_workspace(
-            workspace_id=log_analytics_workspace_id,
-            query=kql,
-            timespan=(lookback_start, now_utc),
-        )
-
-        if response.status == LogsQueryStatus.FAILURE:
-            raise RuntimeError(
-                f"Log AnalyticsクエリがResourceHealth条件照合で失敗しました: {alert_name} "
-                f"(エラー: {getattr(response, 'partial_error', 'Unknown')})"
-            )
-        if response.status == LogsQueryStatus.PARTIAL:
-            self.logger.warning(f"Log Analyticsクエリが部分的な結果を返しました: {alert_name}")
-
-        _tables = response.tables if isinstance(response, LogsQueryResult) else (response.partial_data or [])
-        count: int = int(_tables[0].rows[0][0]) if _tables and _tables[0].rows else 0
-
-        print(f"      - 最新ヘルスイベントがアラート条件に一致: {'あり' if count > 0 else 'なし'}")
-
-        if count > 0:
-            detail = "最新のリソースヘルスイベントがアラート条件に一致しています（発報の恐れあり）"
-            print(f"    -> アラート発報の可能性があります:")
-            print(f"       詳細: {detail}")
-            return False, detail
+            # cause 条件の照合
+            if condition_cause is not None:
+                if reason_type.lower() == condition_cause.lower():
+                    detail = (
+                        f"リソース正常性の原因が '{reason_type}' です"
+                        f"（アラート条件: cause = {condition_cause}）"
+                    )
+                    print(f"    -> アラート発報の可能性があります:")
+                    print(f"       詳細: {detail}")
+                    return False, detail
 
         print("      -> OK")
         return True, "安全"
