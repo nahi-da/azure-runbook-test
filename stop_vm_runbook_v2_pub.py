@@ -122,7 +122,6 @@ def retry(logger: logging.Logger, config: Dict[str, Any]):
                         logger.error(f"{func.__name__} が {max_retries} 回のリトライ後に失敗: {e}")
                         raise
                     logger.warning(f"{func.__name__} 失敗 (試行 {attempt}/{max_retries}): {e}")
-                    logger.info(f"{delay} 秒後にリトライします...")
                     time.sleep(delay)
         return wrapper
     return decorator
@@ -175,11 +174,10 @@ class AzureRunbookOperations:
 
         @retry(self.logger, self.retry_config)
         def _disable():
-            self.logger.info(f"アラートルールを無効化中: {name}")
             resource = ops.get(rg, name)
             resource.enabled = False
             ops.create_or_update(rg, name, resource)
-            self.logger.info(f"アラートルールの無効化に成功: {name}")
+            print("    -> OK")
 
         _disable()
 
@@ -188,14 +186,13 @@ class AzureRunbookOperations:
         ops, p = self._alert_ops(alert_resource_id)
         name, rg = p["resource_name"], p["resource_group"]
 
-        self.logger.info(f"アラートルールの無効化を確認中: {name}")
         resource = ops.get(rg, name)
         is_disabled = not resource.enabled
 
         if is_disabled:
-            self.logger.info(f"確認完了: 無効化されています: {name}")
+            print("    -> OK")
         else:
-            self.logger.error(f"確認失敗: まだ有効です: {name}")
+            self.logger.error(f"  まだ有効です: {name}")
         return is_disabled
 
     def stop_vm(self, vm_resource_id: str) -> None:
@@ -205,11 +202,9 @@ class AzureRunbookOperations:
 
         @retry(self.logger, self.retry_config)
         def _stop():
-            self.logger.info(f"VMを停止中: {vm_name} (リソースグループ: {rg})")
             poller = self._compute(p["subscription"]).virtual_machines.begin_deallocate(rg, vm_name)
-            self.logger.info(f"VM停止操作を開始しました: {vm_name}")
             poller.result()
-            self.logger.info(f"VM停止操作が完了しました: {vm_name}")
+            print("    -> OK")
 
         _stop()
 
@@ -218,7 +213,6 @@ class AzureRunbookOperations:
         p = parse_resource_id(vm_resource_id)
         rg, vm_name = p["resource_group"], p["resource_name"]
 
-        self.logger.info(f"VMの停止状態を確認中: {vm_name}")
         iv = self._compute(p["subscription"]).virtual_machines.instance_view(rg, vm_name)
 
         power_state = next(
@@ -229,9 +223,9 @@ class AzureRunbookOperations:
             self.logger.error(f"VMのPowerStateを取得できませんでした: {vm_name}")
             return False
 
-        self.logger.info(f"VM現在の状態: {vm_name} - {power_state}")
+        print(f"    - 状態: {power_state}")
         if power_state == "PowerState/deallocated":
-            self.logger.info(f"確認完了: VMは割り当て解除状態です: {vm_name}")
+            print("    -> OK")
             return True
         else:
             self.logger.error(f"確認失敗: VMが割り当て解除状態ではありません: {vm_name} ({power_state})")
@@ -336,23 +330,27 @@ def print_execution_summary(execution_results: Dict[str, Any], logger: logging.L
 
 def main():
     """VM停止Runbookのメイン処理"""
+    starttime = datetime.now(JST)
     logger = setup_logging()
-    logger.info("=" * 80)
-    logger.info("VM停止Runbook開始")
-    logger.info("=" * 80)
+    print("=" * 80)
+    print("VM停止Runbook開始", starttime)
+    print("=" * 80)
 
     execution_results = {
-        "start_time": datetime.now(JST),
+        "start_time": starttime,
         "end_time": None,
         "vms": []
     }
 
     try:
-        logger.info("DefaultAzureCredentialを使用してAzureに認証中...")
+        print("認証開始")
         credential = DefaultAzureCredential()
         operations = AzureRunbookOperations(credential, logger, RETRY_CONFIG)
+        print("-> 認証完了")
+        print("")
 
         total_vms = len(VM_ALERT_CONFIG)
+        print("監視抑止・VM割り当て解除開始")
         for idx, (vm_resource_id, alert_rules) in enumerate(VM_ALERT_CONFIG.items(), 1):
             vm_name = parse_resource_id(vm_resource_id)["resource_name"]
             vm_result = {
@@ -364,16 +362,14 @@ def main():
                 "overall_status": "failed"
             }
 
-            logger.info("-" * 80)
-            logger.info(f"VM処理中 {idx}/{total_vms}: {vm_name}")
-            logger.info("-" * 80)
+            print(f"[{idx}/{total_vms}]: {vm_name}")
 
             try:
                 # ステップ1: アラートルール無効化
-                logger.info(f"ステップ1: {vm_name} のアラートルール {len(alert_rules)} 件を無効化中")
+                print("  - アラートルール無効化 {} 件".format(len(alert_rules)))
                 for i, alert_id in enumerate(alert_rules, 1):
                     alert_name = parse_resource_id(alert_id)["resource_name"]
-                    logger.info(f"  [{i}/{len(alert_rules)}] {alert_name}")
+                    print("    - [{}/{}] {}".format(i, len(alert_rules), alert_name))
                     try:
                         operations.disable_alert_rule(alert_id)
                         vm_result["alerts"].append({"name": alert_name, "status": "success", "error": None})
@@ -381,14 +377,14 @@ def main():
                         vm_result["alerts"].append({"name": alert_name, "status": "failed", "error": str(e).split('\n')[0]})
                         logger.error(f"  アラートルールの無効化に失敗: {alert_name}")
                         logger.exception(e)
-                        raise  # アラート無効化失敗時はVM停止をスキップ
+                        raise # アラート無効化失敗時はVM停止をスキップ
 
                 # ステップ2: アラート無効化確認
-                logger.info(f"ステップ2: {vm_name} のアラートルール無効化を確認中")
+                print("  - アラートルール状態確認 {} 件".format(len(alert_rules)))
                 all_disabled = True
                 for i, alert_id in enumerate(alert_rules, 1):
                     alert_name = parse_resource_id(alert_id)["resource_name"]
-                    logger.info(f"  [{i}/{len(alert_rules)}] {alert_name}")
+                    print("    - [{}/{}] {}".format(i, len(alert_rules), alert_name))
                     try:
                         if not operations.verify_alert_rule_disabled(alert_id):
                             all_disabled = False
@@ -404,14 +400,15 @@ def main():
                     logger.error(f"一部のアラートルールが有効です。VM停止をスキップします: {vm_name}")
                     continue
 
-                logger.info(f"{vm_name} のすべてのアラートルールの無効化を確認しました")
+                print("  -> アラートルール無効化完了")
+                print("")
 
                 # ステップ3: VM停止
-                logger.info(f"ステップ3: VM {vm_name} を停止中")
+                print("  - VM割り当て解除要求送信")
                 operations.stop_vm(vm_resource_id)
 
                 # ステップ4: VM停止確認
-                logger.info(f"ステップ4: VM {vm_name} の停止状態を確認中")
+                print("  - VM割り当て解除が成功したか確認")
                 if not operations.verify_vm_stopped(vm_resource_id):
                     vm_result["vm_stop"]["status"] = "failed"
                     vm_result["vm_stop"]["error"] = "停止状態の確認に失敗"
@@ -422,7 +419,8 @@ def main():
                 vm_result["vm_stop"]["power_state"] = "PowerState/deallocated"
                 vm_result["vm_stop"]["error"] = None
                 vm_result["overall_status"] = "success"
-                logger.info(f"{vm_name} の処理が正常に完了しました")
+                print("  -> OK")
+                print("")
 
             except Exception as e:
                 logger.error(f"{vm_name} の処理に失敗: {e}")
