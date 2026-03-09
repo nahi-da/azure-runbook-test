@@ -624,6 +624,58 @@ class AzureStartRunbookOperations:
         lookback_start = now_utc - timedelta(hours=24)
         lookback_start_str = lookback_start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # ── クエリ1: 最新イベントの詳細を取得してログ出力 ────────────────────────
+        kql_detail_lines = [
+            "AzureActivity",
+            f'| where TimeGenerated >= datetime("{lookback_start_str}")',
+            '| where CategoryValue =~ "ResourceHealth"',
+            '| where isnotempty(tostring(Properties_d.currentHealthStatus))',
+        ]
+        kql_detail_lines.extend(scope_filter_lines)
+        kql_detail_lines += [
+            "| order by TimeGenerated desc",
+            "| take 1",
+            "| project TimeGenerated,"
+            " ResourceId,"
+            " currentHealthStatus = tostring(Properties_d.currentHealthStatus),"
+            " previousHealthStatus = tostring(Properties_d.previousHealthStatus),"
+            " cause = tostring(Properties_d.cause)",
+        ]
+        kql_detail = "\n".join(kql_detail_lines)
+
+        self.logger.debug(f"  KQL クエリ (詳細取得):\n{kql_detail}")
+        detail_response = self._logs_client().query_workspace(
+            workspace_id=log_analytics_workspace_id,
+            query=kql_detail,
+            timespan=(lookback_start, now_utc),
+        )
+        if detail_response.status == LogsQueryStatus.FAILURE:
+            raise RuntimeError(
+                f"Log AnalyticsクエリがResourceHealth詳細照会で失敗しました: {alert_name} "
+                f"(エラー: {getattr(detail_response, 'partial_error', 'Unknown')})"
+            )
+
+        _detail_tables = (
+            detail_response.tables
+            if isinstance(detail_response, LogsQueryResult)
+            else (detail_response.partial_data or [])
+        )
+        if _detail_tables and _detail_tables[0].rows:
+            row = _detail_tables[0].rows[0]
+            cols = list(_detail_tables[0].columns)
+            def _col(name: str) -> str:
+                idx = cols.index(name) if name in cols else -1
+                return str(row[idx]) if idx >= 0 and row[idx] is not None else "(なし)"
+            print(f"      - 最新ヘルスイベント:")
+            print(f"          TimeGenerated        : {_col('TimeGenerated')}")
+            print(f"          ResourceId           : {_col('ResourceId')}")
+            print(f"          currentHealthStatus  : {_col('currentHealthStatus')}")
+            print(f"          previousHealthStatus : {_col('previousHealthStatus')}")
+            print(f"          cause                : {_col('cause')}")
+        else:
+            print(f"      - 最新ヘルスイベント: 直近24時間以内にイベントなし")
+
+        # ── クエリ2: 最新イベントがアラート条件に一致するか確認 ─────────────────
         kql_lines = [
             "AzureActivity",
             f'| where TimeGenerated >= datetime("{lookback_start_str}")',
@@ -637,7 +689,7 @@ class AzureStartRunbookOperations:
         kql_lines.append("| count")
         kql = "\n".join(kql_lines)
 
-        self.logger.debug(f"  KQL クエリ:\n{kql}")
+        self.logger.debug(f"  KQL クエリ (条件照合):\n{kql}")
 
         response = self._logs_client().query_workspace(
             workspace_id=log_analytics_workspace_id,
@@ -647,7 +699,7 @@ class AzureStartRunbookOperations:
 
         if response.status == LogsQueryStatus.FAILURE:
             raise RuntimeError(
-                f"Log AnalyticsクエリがResourceHealth照会で失敗しました: {alert_name} "
+                f"Log AnalyticsクエリがResourceHealth条件照合で失敗しました: {alert_name} "
                 f"(エラー: {getattr(response, 'partial_error', 'Unknown')})"
             )
         if response.status == LogsQueryStatus.PARTIAL:
