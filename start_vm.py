@@ -102,6 +102,7 @@ _ALERT_TYPE_MAP: Dict[str, str] = {
 
 
 
+
 # ============================================================================
 # ログ設定
 # ============================================================================
@@ -541,6 +542,7 @@ class AzureStartRunbookOperations:
     def evaluate_activity_log_alert_condition(
         self,
         alert_resource_id: str,
+        vm_resource_id: str,
         log_analytics_workspace_id: str,
         vm_start_time: datetime,
     ) -> Tuple[bool, str]:
@@ -579,7 +581,7 @@ class AzureStartRunbookOperations:
 
         if category == "resourcehealth":
             return self._evaluate_resourcehealth_alert_condition(
-                alert_name, scopes, alert.condition.all_of, p["subscription"],
+                alert_name, scopes, alert.condition.all_of, p["subscription"], vm_resource_id
             )
         else:
             return self._evaluate_activity_log_alert_count_condition(
@@ -593,6 +595,7 @@ class AzureStartRunbookOperations:
         scopes: list[str],
         all_of_conditions,
         subscription_id: str,
+        vm_resource_id: str,
     ) -> Tuple[bool, str]:
         """
         ResourceHealthカテゴリのアクティビティログアラート評価
@@ -610,24 +613,27 @@ class AzureStartRunbookOperations:
 
         # アラート条件から評価対象フィールドを抽出
         # currentHealthStatus / cause のみ SDK で評価可能
-        condition_currenthealth: Optional[str] = None
-        condition_cause: Optional[str] = None
+        condition_currenthealth_list = list()
+        condition_cause_list = list()
+        target_resourceId_list = list()
         for cond in all_of_conditions:
-            if cond.field is None or cond.equals is None:
-                continue
-            field = cond.field.lower()
-            if field == "properties.currenthealthstatus":
-                condition_currenthealth = cond.equals
-            elif field == "properties.cause":
-                condition_cause = cond.equals
-            elif field in ("category", "resourcetype"):
-                pass  # 絞り込み条件のためスキップ
-            else:
-                self.logger.warning(
-                    f"フィールド '{cond.field}' はResourceHealth APIでは評価できないためスキップします: {alert_name}"
-                )
-
-        for resource_id in scopes:
+            if cond.any_of:
+                for anyof_cont in cond.any_of:
+                    field = anyof_cont.field
+                    equals = anyof_cont.equals.lower()
+                    if field == "properties.currentHealthStatus":
+                        condition_currenthealth_list.append(equals)
+                    elif field == "properties.cause":
+                        condition_cause_list.append(equals)
+                    elif field == "resourceId":
+                        target_resourceId_list.append(equals)
+        if not target_resourceId_list:
+            print("Warning: 評価対象のリソースIDが取得できませんでした。")
+            return False, "評価対象のリソースIDが取得できませんでした。"
+        
+        # 起動対象のVMだけでなく、このアラートルールの監視対象すべてで評価を行う仕様に変更
+        meet_conditions = list()
+        for i, resource_id in enumerate(target_resourceId_list):
             try:
                 status = rh_client.availability_statuses.get_by_resource(
                     resource_uri=resource_id,
@@ -651,29 +657,33 @@ class AzureStartRunbookOperations:
             print(f"          summary           : {summary or '(なし)'}")
 
             # currentHealthStatus 条件の照合
-            if condition_currenthealth is not None:
-                if current_state.lower() == condition_currenthealth.lower():
+            if condition_currenthealth_list is not None:
+                if current_state.lower() in condition_currenthealth_list:
                     detail = (
                         f"現在のリソース正常性が '{current_state}' です"
-                        f"（アラート条件: currentHealthStatus = {condition_currenthealth}）"
+                        f"（アラート条件: currentHealthStatus = {condition_currenthealth_list[i]}）"
                     )
                     print(f"    -> アラート発報の可能性があります:")
                     print(f"       詳細: {detail}")
-                    return False, detail
+                    meet_conditions.append(f"{resource_short} - {detail}")
 
             # cause 条件の照合
-            if condition_cause is not None:
-                if reason_type.lower() == condition_cause.lower():
+            if condition_cause_list is not None:
+                if reason_type.lower() in condition_cause_list:
                     detail = (
                         f"リソース正常性の原因が '{reason_type}' です"
-                        f"（アラート条件: cause = {condition_cause}）"
+                        f"（アラート条件: cause = {condition_cause_list[i]}）"
                     )
                     print(f"    -> アラート発報の可能性があります:")
                     print(f"       詳細: {detail}")
-                    return False, detail
+                    meet_conditions.append(f"{resource_short} - {detail}")
 
-        print("      -> OK")
-        return True, "安全"
+        if not meet_conditions:
+            print("      -> All OK")
+            return True, "安全"
+        else:
+            print(f"    -> 一部のアラートが発報条件を満たしていました:")
+            return False, "\n                                                ".join(meet_conditions)
 
     def _evaluate_activity_log_alert_count_condition(
         self,
@@ -780,7 +790,7 @@ class AzureStartRunbookOperations:
         elif full_type == "microsoft.insights/scheduledqueryrules":
             return self.evaluate_scheduled_query_rule_condition(alert_resource_id, log_analytics_workspace_id)
         elif full_type == "microsoft.insights/activitylogalerts":
-            return self.evaluate_activity_log_alert_condition(alert_resource_id, log_analytics_workspace_id, vm_start_time)
+            return self.evaluate_activity_log_alert_condition(alert_resource_id, vm_resource_id, log_analytics_workspace_id, vm_start_time)
         else:
             raise ValueError(f"サポートされていないアラートルールの種類です: {full_type}")
 
