@@ -530,7 +530,198 @@ class AzureStartRunbookOperations:
         print("      -> OK")
         return True, "安全"
 
-    VM起動後
+    def evaluate_activity_log_alert_condition(
+        self,
+        alert_resource_id: str,
+        log_analytics_workspace_id: str,
+        vm_start_time: datetime,
+    ) -> Tuple[bool, str]:
+        """
+        アクティビティログアラートの条件を評価し、発報の恐れがないか確認
+
+        カテゴリに応じて評価方法を切り替える:
+        - ResourceHealth : 最新ヘルスイベントがアラート条件に一致するか確認
+        - その他          : VM起動後の条件一致イベント件数を確認
+
+        Returns:
+            (is_safe, detail_message)
+        """
+        p = parse_resource_id(alert_resource_id)
+        monitor_client = self._monitor(p["subscription"])
+        alert = monitor_client.activity_log_alerts.get(p["resource_group"], p["resource_name"])
+        alert_name = p["resource_name"]
+
+        if not alert.condition or not alert.condition.all_of:
+            self.logger.warning(f"アクティビティログアラートに評価可能な条件がありません: {alert_name}")
+            return True, "条件なし（スキップ）"
+
+        # カテゴリを条件から抽出
+        category: Optional[str] = None
+        for cond in alert.condition.all_of:
+            if cond.field and cond.field.lower() == "category" and cond.equals:
+                category = cond.equals.lower()
+                break
+
+        # スコープ（監視対象リソースID）を取得
+        scopes: list[str] = list(alert.scopes or [])
+
+        now_utc = datetime.now(timezone.utc)
+
+        print(f"      - 種別: アクティビティログアラート (カテゴリ: {category or '不明'})")
+
+        if category == "resourcehealth":
+            return self._evaluate_resourcehealth_alert_condition(
+                alert_name, log_analytics_workspace_id, scopes,
+                alert.condition.all_of, now_utc,
+            )
+        else:
+            return self._evaluate_activity_log_alert_count_condition(
+                alert_name, log_analytics_workspace_id, scopes,
+                alert.condition.all_of, vm_start_time, now_utc,
+            )
+
+    def _evaluate_resourcehealth_alert_condition(
+        self,
+        alert_name: str,
+        log_analytics_workspace_id: str,
+        scopes: list[str],
+        all_of_conditions,
+        now_utc: datetime,
+    ) -> Tuple[bool, str]:
+        """
+        ResourceHealthカテゴリのアクティビティログアラート評価
+
+        直近24時間の最新ヘルスイベント1件を取得し、
+        アラート条件（category以外）に一致するか確認する。
+        最新イベントが条件に一致しない（= 現在は正常状態）であれば安全と判断する。
+        """
+        # スコープフィルタ（対象VMのみに絞る）
+        scope_filter_lines: list[str] = []
+        if scopes:
+            scope_values = ", ".join(f'"{s}"' for s in scopes)
+            scope_filter_lines.append(f"| where ResourceId in~ ({scope_values})")
+
+        # アラート条件（category以外）から照合用where句を構築
+        condition_where_lines: list[str] = []
+        for cond in all_of_conditions:
+            if cond.field is None or cond.equals is None:
+                continue
+            field = cond.field.lower()
+            if field == "category":
+                continue  # カテゴリは既に確定済みのためスキップ
+            kql_column = ACTIVITY_LOG_FIELD_MAP.get(field)
+            if kql_column:
+                if "." in kql_column:
+                    condition_where_lines.append(f'| where tostring({kql_column}) =~ "{cond.equals}"')
+                else:
+                    condition_where_lines.append(f'| where {kql_column} =~ "{cond.equals}"')
+            else:
+                self.logger.warning(
+                    f"フィールド '{cond.field}' のAzureActivityマッピングが未定義です。スキップします。"
+                )
+
+        # 直近24時間を対象に最新の ResourceHealth イベントを1件取得し、条件との照合を行う
+        lookback_start = now_utc - timedelta(hours=24)
+        lookback_start_str = lookback_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        kql_lines = [
+            "AzureActivity",
+            f'| where TimeGenerated >= datetime("{lookback_start_str}")',
+            '| where CategoryValue =~ "ResourceHealth"',
+            '| where isnotempty(tostring(Properties_d.currentHealthStatus))',
+        ]
+        kql_lines.extend(scope_filter_lines)
+        kql_lines.append("| order by TimeGenerated desc")
+        kql_lines.append("| take 1")            # 最新イベント1件のみに絞る
+        kql_lines.extend(condition_where_lines)  # 最新イベントがアラート条件に一致するか照合
+        kql_lines.append("| count")
+        kql = "\n".join(kql_lines)
+
+        self.logger.debug(f"  KQL クエリ:\n{kql}")
+
+        response = self._logs_client().query_workspace(
+            workspace_id=log_analytics_workspace_id,
+            query=kql,
+            timespan=(lookback_start, now_utc),
+        )
+
+        if response.status == LogsQueryStatus.FAILURE:
+            raise RuntimeError(
+                f"Log AnalyticsクエリがResourceHealth照会で失敗しました: {alert_name} "
+                f"(エラー: {getattr(response, 'partial_error', 'Unknown')})"
+            )
+        if response.status == LogsQueryStatus.PARTIAL:
+            self.logger.warning(f"Log Analyticsクエリが部分的な結果を返しました: {alert_name}")
+
+        _tables = response.tables if isinstance(response, LogsQueryResult) else (response.partial_data or [])
+        count: int = int(_tables[0].rows[0][0]) if _tables and _tables[0].rows else 0
+
+        print(f"      - 最新ヘルスイベントがアラート条件に一致: {'あり' if count > 0 else 'なし'}")
+
+        if count > 0:
+            detail = "最新のリソースヘルスイベントがアラート条件に一致しています（発報の恐れあり）"
+            print(f"    -> アラート発報の可能性があります:")
+            print(f"       詳細: {detail}")
+            return False, detail
+
+        print("      -> OK")
+        return True, "安全"
+
+    def _evaluate_activity_log_alert_count_condition(
+        self,
+        alert_name: str,
+        log_analytics_workspace_id: str,
+        scopes: list[str],
+        all_of_conditions,
+        vm_start_time: datetime,
+        now_utc: datetime,
+    ) -> Tuple[bool, str]:
+        """
+        ResourceHealth以外のアクティビティログアラート評価（VM起動後イベントカウント方式）
+
+        VM起動時刻以降に条件一致イベントが0件であれば安全と判断する。
+        """
+        where_clauses: list[str] = []
+        for cond in all_of_conditions:
+            if cond.field is None or cond.equals is None:
+                self.logger.debug(f"field/equals が未設定の条件をスキップ: {alert_name}")
+                continue
+            field = cond.field.lower()
+            value = cond.equals
+            kql_column = ACTIVITY_LOG_FIELD_MAP.get(field)
+            if kql_column:
+                if "." in kql_column:
+                    where_clauses.append(f'tostring({kql_column}) =~ "{value}"')
+                else:
+                    where_clauses.append(f'{kql_column} =~ "{value}"')
+            else:
+                self.logger.warning(
+                    f"フィールド '{cond.field}' のAzureActivityマッピングが未定義です。スキップします。"
+                )
+
+        # 有効なフィルタ条件が構築できない場合は評価不可のためスキップ（安全側に倒す）
+        if not where_clauses:
+            self.logger.warning(f"有効なフィルタ条件が構築できなかったためスキップします: {alert_name}")
+            return True, "条件構築不可（スキップ）"
+
+        start_str = vm_start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        kql_lines = [
+            "AzureActivity",
+            f'| where TimeGenerated >= datetime("{start_str}")',
+            f'| where TimeGenerated <= datetime("{end_str}")',
+        ]
+        # スコープフィルタ（監視対象リソースIDに限定し、他リソースのイベントを除外）
+        if scopes:
+            scope_values = ", ".join(f'"{s}"' for s in scopes)
+            kql_lines.append(f"| where ResourceId in~ ({scope_values})")
+        for clause in where_clauses:
+            kql_lines.append(f"| where {clause}")
+        kql_lines.append("| count")
+        kql = "\n".join(kql_lines)
+
+        self.logger.debug(f"  KQL クエリ:\n{kql}")
 
         response = self._logs_client().query_workspace(
             workspace_id=log_analytics_workspace_id,
@@ -845,6 +1036,10 @@ def main():
             # print("-" * 80)
 
             try:
+                # VM起動時刻を記録（activitylogalerts評価で使用）
+                # start_vm() 呼び出し前に記録することで、起動プロセス中に発生したイベントを捕捉漏れなく評価できる
+                vm_actual_start_time = datetime.now(timezone.utc)
+
                 # ステップ1: VM起動
                 print("  - 起動要求送信")
                 operations.start_vm(vm_resource_id)
@@ -860,9 +1055,6 @@ def main():
                 vm_result["vm_start"]["status"] = "success"
                 vm_result["vm_start"]["power_state"] = "PowerState/running"
                 vm_result["vm_start"]["error"] = None
-
-                # VM起動時刻を記録（activitylogalerts評価で使用）
-                vm_actual_start_time = datetime.now(timezone.utc)
 
                 # ステップ3: 起動後待機（ラート条件評価前の安定化を待機）
                 print(f"  - 起動後待機中 ({post_start_wait}秒)")
@@ -914,8 +1106,7 @@ def main():
                             "status": "skipped",
                             "error": "アラート条件評価が安全でないためスキップ",
                         })
-                    logger.error(f"{vm_name} の一部のアラート条件が安全でないため、全アラートルールの有効化をスキップします")
-                    continue
+                    raise Exception(f"{vm_name}: アラート条件が安全でないため、全アラートルールの有効化をスキップします")
 
                 print("    -> 評価完了")
 
