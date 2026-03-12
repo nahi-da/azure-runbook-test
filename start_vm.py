@@ -656,27 +656,41 @@ class AzureStartRunbookOperations:
             print(f"          occurredTime      : {occurred_time or '(なし)'}")
             print(f"          summary           : {summary or '(なし)'}")
 
-            # currentHealthStatus 条件の照合
-            if condition_currenthealth_list is not None:
-                if current_state.lower() in condition_currenthealth_list:
-                    detail = (
-                        f"現在のリソース正常性が '{current_state}' です"
-                        f"（アラート条件: currentHealthStatus = {condition_currenthealth_list[i]}）"
-                    )
-                    print(f"    -> アラート発報の可能性があります:")
-                    print(f"       詳細: {detail}")
-                    meet_conditions.append(f"{resource_short} - {detail}")
+            # all_of の AND 条件評価
+            # Azure ActivityLogAlert の condition 構造:
+            #   allOf[*] → 全要素が成立した場合にアラート発報（AND ロジック）
+            #   anyOf[*] → いずれかの要素が成立すればOK（OR ロジック）
+            # currentHealthStatus と cause はそれぞれ別の allOf 要素として定義されているため、
+            # 両方指定されている場合は両方が一致して初めてアラート発報となる（AND ロジック）
+            currenthealth_matches = (
+                bool(condition_currenthealth_list)
+                and current_state.lower() in condition_currenthealth_list
+            )
+            cause_matches = (
+                bool(condition_cause_list)
+                and reason_type.lower() in condition_cause_list
+            )
 
-            # cause 条件の照合
-            if condition_cause_list is not None:
-                if reason_type.lower() in condition_cause_list:
-                    detail = (
-                        f"リソース正常性の原因が '{reason_type}' です"
-                        f"（アラート条件: cause = {condition_cause_list[i]}）"
+            # 指定されている全条件がすべて成立した場合のみ発報と判定
+            all_conditions_met = (
+                (not condition_currenthealth_list or currenthealth_matches)
+                and (not condition_cause_list or cause_matches)
+                and (condition_currenthealth_list or condition_cause_list)
+            )
+            if all_conditions_met:
+                matched_parts = []
+                if currenthealth_matches:
+                    matched_parts.append(
+                        f"currentHealthStatus='{current_state}' ∈ {condition_currenthealth_list}"
                     )
-                    print(f"    -> アラート発報の可能性があります:")
-                    print(f"       詳細: {detail}")
-                    meet_conditions.append(f"{resource_short} - {detail}")
+                if cause_matches:
+                    matched_parts.append(
+                        f"cause='{reason_type}' ∈ {condition_cause_list}"
+                    )
+                detail = f"リソース正常性アラート条件（AND）に合致: {', '.join(matched_parts)}"
+                print(f"    -> アラート発報の可能性があります:")
+                print(f"       詳細: {detail}")
+                meet_conditions.append(f"{resource_short} - {detail}")
 
         if not meet_conditions:
             print("      -> All OK")
